@@ -1,4 +1,4 @@
-import std/[streams, tables, sequtils, math, memfiles, strutils]
+import std/[streams, tables, sequtils, math, memfiles, strutils, os]
 import gguf, tensor, tokenizer
 
 type
@@ -84,6 +84,13 @@ proc getInt(v: MetadataValue): int =
 proc loadModel*(filename: string, contextLength: int): LlamaModel =
   let gguf = loadGGUF(filename)
   let m = memfiles.open(filename)
+
+  # madvise for performance on Linux
+  when defined(linux):
+    proc madvise(addrp: pointer, length: int, advice: int): int {.header: "<sys/mman.h>", importc: "madvise".}
+    const MADV_RANDOM = 1
+    const MADV_WILLNEED = 3
+    discard madvise(m.mem, m.size, MADV_WILLNEED)
 
   let metadata = gguf.metadata
   let vocabTokens = metadata["tokenizer.ggml.tokens"].arr.mapIt(it.s)

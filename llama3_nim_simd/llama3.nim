@@ -80,7 +80,8 @@ proc runInteractive(model: LlamaModel, sampler: Sampler, options: Options) =
   let cf = newChatFormat(model.tokenizer)
   conversationTokens.add(cf.beginOfText)
   if options.systemPrompt != "":
-    conversationTokens.add(cf.encodeMessage(Message(role: roleSystem, content: options.systemPrompt)))
+    for t in cf.encodeMessage(Message(role: roleSystem, content: options.systemPrompt)):
+      conversationTokens.add(t)
 
   var startPosition = 0
   while true:
@@ -93,8 +94,10 @@ proc runInteractive(model: LlamaModel, sampler: Sampler, options: Options) =
       break
     if userText in ["quit", "exit"]: break
 
-    conversationTokens.add(cf.encodeMessage(Message(role: roleUser, content: userText)))
-    conversationTokens.add(cf.encodeHeader(Message(role: roleAssistant, content: "")))
+    for t in cf.encodeMessage(Message(role: roleUser, content: userText)):
+      conversationTokens.add(t)
+    for t in cf.encodeHeader(Message(role: roleAssistant, content: "")):
+      conversationTokens.add(t)
 
     let responseTokens = generateTokens(model, state, startPosition, conversationTokens[startPosition..^1], cf.stopTokens, options.maxTokens, sampler, options.echo, proc(t: int) =
       if options.stream:
@@ -103,7 +106,8 @@ proc runInteractive(model: LlamaModel, sampler: Sampler, options: Options) =
           stdout.flushFile()
     )
 
-    conversationTokens.add(responseTokens)
+    for t in responseTokens:
+      conversationTokens.add(t)
     startPosition = conversationTokens.len
 
     var cleanResponse = responseTokens
@@ -123,9 +127,12 @@ proc runInstructOnce(model: LlamaModel, sampler: Sampler, options: Options) =
   var promptTokens = newSeq[int]()
   promptTokens.add(cf.beginOfText)
   if options.systemPrompt != "":
-    promptTokens.add(cf.encodeMessage(Message(role: roleSystem, content: options.systemPrompt)))
-  promptTokens.add(cf.encodeMessage(Message(role: roleUser, content: options.prompt)))
-  promptTokens.add(cf.encodeHeader(Message(role: roleAssistant, content: "")))
+    for t in cf.encodeMessage(Message(role: roleSystem, content: options.systemPrompt)):
+      promptTokens.add(t)
+  for t in cf.encodeMessage(Message(role: roleUser, content: options.prompt)):
+    promptTokens.add(t)
+  for t in cf.encodeHeader(Message(role: roleAssistant, content: "")):
+    promptTokens.add(t)
 
   let responseTokens = generateTokens(model, state, 0, promptTokens, cf.stopTokens, options.maxTokens, sampler, options.echo, proc(t: int) =
     if options.stream:
