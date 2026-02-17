@@ -75,7 +75,7 @@ proc parseOptions(): Options =
     quit(1)
 
 proc runInteractive(model: LlamaModel, sampler: Sampler, options: Options) =
-  var state = newState(model.config)
+  var state = newState(model)
   var conversationTokens = newSeq[int]()
   let cf = newChatFormat(model.tokenizer)
   conversationTokens.add(cf.beginOfText)
@@ -122,7 +122,7 @@ proc runInteractive(model: LlamaModel, sampler: Sampler, options: Options) =
       break
 
 proc runInstructOnce(model: LlamaModel, sampler: Sampler, options: Options) =
-  let state = newState(model.config)
+  let state = newState(model)
   let cf = newChatFormat(model.tokenizer)
   var promptTokens = newSeq[int]()
   promptTokens.add(cf.beginOfText)

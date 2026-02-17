@@ -1,5 +1,5 @@
-import std/[math, sequtils, times, strformat, sets]
-import tensor, tokenizer, model_base
+import std/[math, times, strformat, sets, tables]
+import tensor, tokenizer, model_base, malebolgia, nimsimd/avx2, nimsimd/fma
 
 type
   State* = ref object
@@ -10,12 +10,13 @@ type
   Sampler* = proc(logits: FloatTensor): int {.closure.}
 
   ProfileStats* = object
-    matmulTime*, attnTime*, rmsNormTime*, softmaxTime*, samplingTime*: float
+    matmulTime*, attnTime*, rmsNormTime*, softmaxTime*, samplingTime*, ropeTime*: float
     totalTime*: float
 
 var globalProfile*: ProfileStats
 
-proc newState*(config: Configuration): State =
+proc newState*(model: LlamaModel): State =
+  let config = model.config
   result = State()
   result.x = newArrayFloatTensor(config.dim)
   result.xb = newArrayFloatTensor(config.dim)
@@ -35,7 +36,50 @@ proc newState*(config: Configuration): State =
     result.keyCache[l] = newArrayFloatTensor(config.contextLength * kvDim)
     result.valueCache[l] = newArrayFloatTensor(config.contextLength * kvDim)
 
-proc forward*(model: LlamaModel, state: State, token: int, position: int): FloatTensor =
+  result.latestToken = model.tokenizer.specialTokens.getOrDefault("<|begin_of_text|>", 0)
+
+proc attnWorker(pQ, pKBase, pAtt, pXb, pVBase: ptr float32, position, kvDim, headSize, kvMul, contextLength: int, sqrtHeadSize: float32) =
+  let pQa = cast[ptr UncheckedArray[float32]](pQ)
+  let pKBa = cast[ptr UncheckedArray[float32]](pKBase)
+  let pAtta = cast[ptr UncheckedArray[float32]](pAtt)
+  let pXba = cast[ptr UncheckedArray[float32]](pXb)
+  let pVBa = cast[ptr UncheckedArray[float32]](pVBase)
+
+  for t in 0..position:
+    let kOffset = t * kvDim
+    let pK = addr pKBa[kOffset]
+    var score = dotAvx(cast[ptr float32](pQa), cast[ptr float32](pK), headSize)
+    score /= sqrtHeadSize
+    pAtta[t] = score
+
+  # Softmax
+  var maxVal = pAtta[0]
+  for t in 1..position:
+    if pAtta[t] > maxVal: maxVal = pAtta[t]
+  var sum = 0.0f32
+  for t in 0..position:
+    pAtta[t] = exp(pAtta[t] - maxVal)
+    sum += pAtta[t]
+  for t in 0..position:
+    pAtta[t] /= sum
+
+  for i in 0..<headSize: pXba[i] = 0.0f32
+
+  for t in 0..position:
+    let vOffset = t * kvDim
+    let pV = addr pVBa[vOffset]
+    let a = pAtta[t]
+    let av = mm256_set1_ps(a)
+    var i = 0
+    let pVa = cast[ptr UncheckedArray[float32]](pV)
+    while i <= headSize - 8:
+      mm256_storeu_ps(addr pXba[i], mm256_fmadd_ps(av, mm256_loadu_ps(addr pVa[i]), mm256_loadu_ps(addr pXba[i])))
+      i += 8
+    while i < headSize:
+      pXba[i] += a * pVa[i]
+      i += 1
+
+proc forward*(ctx: var Master, model: LlamaModel, state: State, token: int, position: int): FloatTensor =
   let config = model.config
   let weights = model.weights
   let dim = config.dim
@@ -44,103 +88,93 @@ proc forward*(model: LlamaModel, state: State, token: int, position: int): Float
   let kvMul = config.numberOfHeads div config.numberOfKeyValueHeads
   let sqrtHeadSize = sqrt(headSize.float32)
 
-  # copy the token embedding into x
   weights.tokenEmbeddingTable.copyTo(token * dim, state.x, 0, dim)
 
   for l in 0..<config.numberOfLayers:
-    # attention rmsnorm
     var t0 = cpuTime()
     rmsnorm(state.xb, state.x, weights.rmsAttWeight[l], dim, config.rmsNormEps)
     globalProfile.rmsNormTime += cpuTime() - t0
 
-    # qkv matmuls for this position
     t0 = cpuTime()
-    weights.wq[l].matmul(state.xb, state.q, dim, dim)
-    weights.wk[l].matmul(state.xb, state.k, kvDim, dim)
-    weights.wv[l].matmul(state.xb, state.v, kvDim, dim)
+    ctx.matmulMT(weights.wq[l], state.xb, state.q, dim, dim)
+    ctx.matmulMT(weights.wk[l], state.xb, state.k, kvDim, dim)
+    ctx.matmulMT(weights.wv[l], state.xb, state.v, kvDim, dim)
     globalProfile.matmulTime += cpuTime() - t0
 
-    # RoPE relative positional encoding
-    for i in countup(0, dim - 1, 2):
-      let headDim = i mod headSize
-      let fcr = weights.freqCisReal[position * (headSize div 2) + (headDim div 2)]
-      let fci = weights.freqCisImag[position * (headSize div 2) + (headDim div 2)]
-      let rotn = if i < kvDim: 2 else: 1
-      for v in 0..<rotn:
-        let vec = if v == 0: state.q else: state.k
-        let v0 = getFloat(vec, i)
-        let v1 = getFloat(vec, i + 1)
-        setFloat(vec, i, v0 * fcr - v1 * fci)
-        setFloat(vec, i + 1, v0 * fci + v1 * fcr)
+    # Vectorized RoPE
+    t0 = cpuTime()
+    let pQa = cast[ptr UncheckedArray[float32]](addr state.q.data[0])
+    let pKa = cast[ptr UncheckedArray[float32]](addr state.k.data[0])
+    let pFcr = cast[ptr UncheckedArray[float32]](unsafeAddr weights.freqCisReal[0])
+    let pFci = cast[ptr UncheckedArray[float32]](unsafeAddr weights.freqCisImag[0])
+    let sign_v = mm256_set_ps(1.0f32, -1.0f32, 1.0f32, -1.0f32, 1.0f32, -1.0f32, 1.0f32, -1.0f32)
 
-    # save key, value at this time step to our kv cache
+    for i in countup(0, dim - 1, 8):
+      let headDimBase = i mod headSize
+      let fcr4 = mm_loadu_ps(addr pFcr[position * (headSize div 2) + (headDimBase div 2)])
+      let fci4 = mm_loadu_ps(addr pFci[position * (headSize div 2) + (headDimBase div 2)])
+      let fcr8 = mm256_set_m128(mm_unpackhi_ps(fcr4, fcr4), mm_unpacklo_ps(fcr4, fcr4))
+      let fci8 = mm256_set_m128(mm_unpackhi_ps(fci4, fci4), mm_unpacklo_ps(fci4, fci4))
+
+      var qv = mm256_loadu_ps(addr pQa[i])
+      var qs = mm256_shuffle_ps(qv, qv, 0xB1)
+      var resQ = mm256_fmadd_ps(mm256_mul_ps(sign_v, qs), fci8, mm256_mul_ps(qv, fcr8))
+      mm256_storeu_ps(addr pQa[i], resQ)
+
+      if i < kvDim:
+        var kv = mm256_loadu_ps(addr pKa[i])
+        var ks = mm256_shuffle_ps(kv, kv, 0xB1)
+        var resK = mm256_fmadd_ps(mm256_mul_ps(sign_v, ks), fci8, mm256_mul_ps(kv, fcr8))
+        mm256_storeu_ps(addr pKa[i], resK)
+    globalProfile.ropeTime += cpuTime() - t0
+
     state.k.copyTo(0, state.keyCache[l], position * kvDim, kvDim)
     state.v.copyTo(0, state.valueCache[l], position * kvDim, kvDim)
 
-    # multihead attention
     t0 = cpuTime()
-    for h in 0..<config.numberOfHeads:
-      let qOffset = h * headSize
-      let attOffset = h * config.contextLength
-
-      for t in 0..position:
-        let keyCacheOffset = t * kvDim + (h div kvMul) * headSize
-        var score = dot(state.q, state.keyCache[l], qOffset, keyCacheOffset, headSize)
-        score /= sqrtHeadSize
-        setFloat(state.att, attOffset + t, score)
-
-      state.att.softmaxInPlace(attOffset, position + 1)
-
-      let xbOffset = h * headSize
-      state.xb.fillInPlace(xbOffset, headSize, 0.0f32)
-
-      for t in 0..position:
-        let vOffset = t * kvDim + (h div kvMul) * headSize
-        let a = getFloat(state.att, attOffset + t)
-        state.xb.saxpyInPlace(xbOffset, state.valueCache[l], vOffset, headSize, a)
+    ctx.awaitAll:
+      for h in 0..<config.numberOfHeads:
+        let pQh = addr state.q.data[h * headSize]
+        let pKhBase = addr state.keyCache[l].data[(h div kvMul) * headSize]
+        let pAtth = addr state.att.data[h * config.contextLength]
+        let pXbh = addr state.xb.data[h * headSize]
+        let pVhBase = addr state.valueCache[l].data[(h div kvMul) * headSize]
+        ctx.spawn attnWorker(pQh, pKhBase, pAtth, pXbh, pVhBase, position, kvDim, headSize, kvMul, config.contextLength, sqrtHeadSize)
     globalProfile.attnTime += cpuTime() - t0
 
-    # final matmul to get the output of the attention
     t0 = cpuTime()
-    weights.wo[l].matmul(state.xb, state.xb2, dim, dim)
+    ctx.matmulMT(weights.wo[l], state.xb, state.xb2, dim, dim)
     globalProfile.matmulTime += cpuTime() - t0
 
-    # residual connection
     state.x.addInPlace(state.xb2)
 
-    # ffn rmsnorm
     t0 = cpuTime()
     rmsnorm(state.xb, state.x, weights.rmsFfnWeight[l], dim, config.rmsNormEps)
     globalProfile.rmsNormTime += cpuTime() - t0
 
-    # SwiGLU FFN
     t0 = cpuTime()
-    weights.w1[l].matmul(state.xb, state.hb, config.hiddenDim, dim)
-    weights.w3[l].matmul(state.xb, state.hb2, config.hiddenDim, dim)
+    ctx.matmulMT(weights.w1[l], state.xb, state.hb, config.hiddenDim, dim)
+    ctx.matmulMT(weights.w3[l], state.xb, state.hb2, config.hiddenDim, dim)
     globalProfile.matmulTime += cpuTime() - t0
 
-    # SwiGLU non-linearity
+    let pHba = cast[ptr UncheckedArray[float32]](addr state.hb.data[0])
+    let pHb2a = cast[ptr UncheckedArray[float32]](addr state.hb2.data[0])
     for i in 0..<config.hiddenDim:
-      let v = getFloat(state.hb, i)
-      setFloat(state.hb, i, v / (1.0f32 + exp(-v)))
-
-    state.hb.multiplyInPlace(state.hb2)
+      let v = pHba[i]
+      pHba[i] = (v / (1.0f32 + exp(-v))) * pHb2a[i]
 
     t0 = cpuTime()
-    weights.w2[l].matmul(state.hb, state.xb, dim, config.hiddenDim)
+    ctx.matmulMT(weights.w2[l], state.hb, state.xb, dim, config.hiddenDim)
     globalProfile.matmulTime += cpuTime() - t0
 
-    # residual connection
     state.x.addInPlace(state.xb)
 
-  # final rmsnorm
   var t0 = cpuTime()
   rmsnorm(state.x, state.x, weights.rmsFinalWeight, dim, config.rmsNormEps)
   globalProfile.rmsNormTime += cpuTime() - t0
 
-  # classifier into logits
   t0 = cpuTime()
-  weights.wcls.matmul(state.x, state.logits, config.vocabularySize, dim)
+  ctx.matmulMT(weights.wcls, state.x, state.logits, config.vocabularySize, dim)
   globalProfile.matmulTime += cpuTime() - t0
 
   return state.logits
@@ -156,11 +190,13 @@ proc generateTokens*(model: LlamaModel, state: State, startPosition: int, prompt
   var nextToken: int
   var promptIndex = 0
 
+  # BOS fix as in scalar version
   if promptIndex < promptTokens.len and promptTokens[promptIndex] == token:
     promptIndex += 1
 
+  var ctx = malebolgia.createMaster()
   for position in startPosition..<maxToks:
-    let logits = forward(model, state, token, position)
+    let logits = forward(ctx, model, state, token, position)
 
     var t0 = cpuTime()
     if promptIndex < promptTokens.len:
@@ -184,13 +220,13 @@ proc generateTokens*(model: LlamaModel, state: State, startPosition: int, prompt
 
   let elapsed = cpuTime() - startTime
   globalProfile.totalTime = elapsed
-  let totalTokens = (if promptIndex > 0: promptIndex else: 0) + result.len
+  let totalTokens = promptIndex + result.len
   stderr.writeLine(&"\n{totalTokens.float / elapsed:.2f} tokens/s ({totalTokens})")
 
-  # Print profiling results
   stderr.writeLine("--- Profiling Results ---")
   stderr.writeLine(&"Matmul:  {globalProfile.matmulTime / elapsed * 100:5.2f}% ({globalProfile.matmulTime:5.2f}s)")
   stderr.writeLine(&"Attn:    {globalProfile.attnTime / elapsed * 100:5.2f}% ({globalProfile.attnTime:5.2f}s)")
   stderr.writeLine(&"RMSNorm: {globalProfile.rmsNormTime / elapsed * 100:5.2f}% ({globalProfile.rmsNormTime:5.2f}s)")
+  stderr.writeLine(&"RoPE:    {globalProfile.ropeTime / elapsed * 100:5.2f}% ({globalProfile.ropeTime:5.2f}s)")
   stderr.writeLine(&"Sampling:{globalProfile.samplingTime / elapsed * 100:5.2f}% ({globalProfile.samplingTime:5.2f}s)")
   stderr.writeLine(&"Total:   100.00% ({elapsed:5.2f}s)")
