@@ -1,4 +1,4 @@
-import std/[math, sequtils, times, strformat, sets]
+import std/[math, sequtils, times, strformat, sets, tables]
 import tensor, tokenizer, model_base
 
 type
@@ -9,7 +9,8 @@ type
 
   Sampler* = proc(logits: FloatTensor): int {.closure.}
 
-proc newState*(config: Configuration): State =
+proc newState*(model: LlamaModel): State =
+  let config = model.config
   result = State()
   result.x = newArrayFloatTensor(config.dim)
   result.xb = newArrayFloatTensor(config.dim)
@@ -28,6 +29,8 @@ proc newState*(config: Configuration): State =
   for l in 0..<config.numberOfLayers:
     result.keyCache[l] = newArrayFloatTensor(config.contextLength * kvDim)
     result.valueCache[l] = newArrayFloatTensor(config.contextLength * kvDim)
+
+  result.latestToken = model.tokenizer.specialTokens.getOrDefault("<|begin_of_text|>", 0)
 
 proc forward*(model: LlamaModel, state: State, token: int, position: int): FloatTensor =
   let config = model.config
@@ -91,7 +94,7 @@ proc forward*(model: LlamaModel, state: State, token: int, position: int): Float
     # final matmul to get the output of the attention
     weights.wo[l].matmul(state.xb, state.xb2, dim, dim)
 
-    # residual connection
+    # residual connection back into x
     state.x.addInPlace(state.xb2)
 
     # ffn rmsnorm
