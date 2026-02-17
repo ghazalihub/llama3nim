@@ -1,4 +1,4 @@
-import std/[math, times, strformat, sets, tables]
+import std/[math, times, strformat, sets, tables, cpuinfo]
 import tensor, tokenizer, model_base, malebolgia, nimsimd/avx2, nimsimd/fma
 
 type
@@ -38,46 +38,56 @@ proc newState*(model: LlamaModel): State =
 
   result.latestToken = model.tokenizer.specialTokens.getOrDefault("<|begin_of_text|>", 0)
 
-proc attnWorker(pQ, pKBase, pAtt, pXb, pVBase: ptr float32, position, kvDim, headSize, kvMul, contextLength: int, sqrtHeadSize: float32) =
-  let pQa = cast[ptr UncheckedArray[float32]](pQ)
-  let pKBa = cast[ptr UncheckedArray[float32]](pKBase)
-  let pAtta = cast[ptr UncheckedArray[float32]](pAtt)
-  let pXba = cast[ptr UncheckedArray[float32]](pXb)
-  let pVBa = cast[ptr UncheckedArray[float32]](pVBase)
+proc hsum(v: M256): float32 {.inline.} =
+  let v128 = mm_add_ps(mm256_extractf128_ps(v, 1), mm256_castps256_ps128(v))
+  let shuf = mm_movehdup_ps(v128)
+  let sums = mm_add_ps(v128, shuf)
+  let shuf2 = mm_movehl_ps(sums, sums)
+  let sums2 = mm_add_ss(sums, shuf2)
+  return mm_cvtss_f32(sums2)
 
-  for t in 0..position:
-    let kOffset = t * kvDim
-    let pK = addr pKBa[kOffset]
-    var score = dotAvx(cast[ptr float32](pQa), cast[ptr float32](pK), headSize)
-    score /= sqrtHeadSize
-    pAtta[t] = score
+proc multiHeadAttnWorker(pQ_base, pAtt_base, pXb_base, pKeyCache_base, pValueCache_base: ptr float32, sH, eH: int, position, kvDim, headSize, kvMul, contextLength: int, sqrtHeadSize: float32) =
+  let num_regs = headSize div 8
+  var q_regs: array[64, M256]
 
-  # Softmax
-  var maxVal = pAtta[0]
-  for t in 1..position:
-    if pAtta[t] > maxVal: maxVal = pAtta[t]
-  var sum = 0.0f32
-  for t in 0..position:
-    pAtta[t] = exp(pAtta[t] - maxVal)
-    sum += pAtta[t]
-  for t in 0..position:
-    pAtta[t] /= sum
+  for h in sH..<eH:
+    let qOffset = h * headSize
+    let attOffset = h * contextLength
+    let xbOffset = h * headSize
 
-  for i in 0..<headSize: pXba[i] = 0.0f32
+    let pQa = cast[ptr UncheckedArray[float32]](cast[uint](pQ_base) + qOffset.uint * 4)
+    let pKBa = cast[ptr UncheckedArray[float32]](cast[uint](pKeyCache_base) + (h div kvMul).uint * headSize.uint * 4)
+    let pAtta = cast[ptr UncheckedArray[float32]](cast[uint](pAtt_base) + attOffset.uint * 4)
+    let pXba = cast[ptr UncheckedArray[float32]](cast[uint](pXb_base) + xbOffset.uint * 4)
+    let pVBa = cast[ptr UncheckedArray[float32]](cast[uint](pValueCache_base) + (h div kvMul).uint * headSize.uint * 4)
 
-  for t in 0..position:
-    let vOffset = t * kvDim
-    let pV = addr pVBa[vOffset]
-    let a = pAtta[t]
-    let av = mm256_set1_ps(a)
-    var i = 0
-    let pVa = cast[ptr UncheckedArray[float32]](pV)
-    while i <= headSize - 8:
-      mm256_storeu_ps(addr pXba[i], mm256_fmadd_ps(av, mm256_loadu_ps(addr pVa[i]), mm256_loadu_ps(addr pXba[i])))
-      i += 8
-    while i < headSize:
-      pXba[i] += a * pVa[i]
-      i += 1
+    for i in 0..<num_regs:
+      q_regs[i] = mm256_loadu_ps(addr pQa[i * 8])
+
+    for t in 0..position:
+      let pK = cast[ptr UncheckedArray[float32]](addr pKBa[t * kvDim])
+      var sumv = mm256_setzero_ps()
+      for i in 0..<num_regs:
+        sumv = mm256_fmadd_ps(q_regs[i], mm256_loadu_ps(addr pK[i * 8]), sumv)
+      pAtta[t] = hsum(sumv) / sqrtHeadSize
+
+    var maxVal = pAtta[0]
+    for t in 1..position:
+      if pAtta[t] > maxVal: maxVal = pAtta[t]
+    var sum = 0.0f32
+    for t in 0..position:
+      pAtta[t] = exp(pAtta[t] - maxVal)
+      sum += pAtta[t]
+    for t in 0..position:
+      pAtta[t] /= sum
+
+    for i in 0..<headSize: pXba[i] = 0.0f32
+    for t in 0..position:
+      let a = pAtta[t]
+      let av = mm256_set1_ps(a)
+      let pV = cast[ptr UncheckedArray[float32]](addr pVBa[t * kvDim])
+      for i in 0..<num_regs:
+        mm256_storeu_ps(addr pXba[i * 8], mm256_fmadd_ps(av, mm256_loadu_ps(addr pV[i * 8]), mm256_loadu_ps(addr pXba[i * 8])))
 
 proc forward*(ctx: var Master, model: LlamaModel, state: State, token: int, position: int): FloatTensor =
   let config = model.config
@@ -101,7 +111,6 @@ proc forward*(ctx: var Master, model: LlamaModel, state: State, token: int, posi
     ctx.matmulMT(weights.wv[l], state.xb, state.v, kvDim, dim)
     globalProfile.matmulTime += cpuTime() - t0
 
-    # Vectorized RoPE
     t0 = cpuTime()
     let pQa = cast[ptr UncheckedArray[float32]](addr state.q.data[0])
     let pKa = cast[ptr UncheckedArray[float32]](addr state.k.data[0])
@@ -132,14 +141,17 @@ proc forward*(ctx: var Master, model: LlamaModel, state: State, token: int, posi
     state.v.copyTo(0, state.valueCache[l], position * kvDim, kvDim)
 
     t0 = cpuTime()
+    let numThreads = countProcessors()
+    let headsPerThread = (config.numberOfHeads + numThreads - 1) div numThreads
+    let pQ_base = addr state.q.data[0]
+    let pAtt_base = addr state.att.data[0]
+    let pXb_base = addr state.xb.data[0]
+    let pKeyCache_base = addr state.keyCache[l].data[0]
+    let pValueCache_base = addr state.valueCache[l].data[0]
     ctx.awaitAll:
-      for h in 0..<config.numberOfHeads:
-        let pQh = addr state.q.data[h * headSize]
-        let pKhBase = addr state.keyCache[l].data[(h div kvMul) * headSize]
-        let pAtth = addr state.att.data[h * config.contextLength]
-        let pXbh = addr state.xb.data[h * headSize]
-        let pVhBase = addr state.valueCache[l].data[(h div kvMul) * headSize]
-        ctx.spawn attnWorker(pQh, pKhBase, pAtth, pXbh, pVhBase, position, kvDim, headSize, kvMul, config.contextLength, sqrtHeadSize)
+      for t in 0..<numThreads:
+        let sH = t * headsPerThread; let eH = min(sH + headsPerThread, config.numberOfHeads)
+        if sH < eH: ctx.spawn multiHeadAttnWorker(pQ_base, pAtt_base, pXb_base, pKeyCache_base, pValueCache_base, sH, eH, position, kvDim, headSize, kvMul, config.contextLength, sqrtHeadSize)
     globalProfile.attnTime += cpuTime() - t0
 
     t0 = cpuTime()
@@ -157,11 +169,7 @@ proc forward*(ctx: var Master, model: LlamaModel, state: State, token: int, posi
     ctx.matmulMT(weights.w3[l], state.xb, state.hb2, config.hiddenDim, dim)
     globalProfile.matmulTime += cpuTime() - t0
 
-    let pHba = cast[ptr UncheckedArray[float32]](addr state.hb.data[0])
-    let pHb2a = cast[ptr UncheckedArray[float32]](addr state.hb2.data[0])
-    for i in 0..<config.hiddenDim:
-      let v = pHba[i]
-      pHba[i] = (v / (1.0f32 + exp(-v))) * pHb2a[i]
+    siluMultiplyMT(ctx, state.hb, state.hb2)
 
     t0 = cpuTime()
     ctx.matmulMT(weights.w2[l], state.hb, state.xb, dim, config.hiddenDim)
@@ -190,7 +198,6 @@ proc generateTokens*(model: LlamaModel, state: State, startPosition: int, prompt
   var nextToken: int
   var promptIndex = 0
 
-  # BOS fix as in scalar version
   if promptIndex < promptTokens.len and promptTokens[promptIndex] == token:
     promptIndex += 1
 

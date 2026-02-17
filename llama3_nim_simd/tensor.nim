@@ -147,9 +147,23 @@ proc matmulMT*(ctx: var Master, thiz, that, res: FloatTensor, dim0, dim1: int) =
         let sR = t * chunkSize; let eR = min(sR + chunkSize, dim0)
         if sR < eR: ctx.spawn gemv_q4_array_worker(pW, pA, pO, sR, eR, dim1)
 
-proc matmul*(thiz, that, res: FloatTensor, dim0, dim1: int) =
-  var ctx = malebolgia.createMaster()
-  matmulMT(ctx, thiz, that, res, dim0, dim1)
+proc silu_multiply_worker(pHb, pHb2: ptr float32, s, e: int) =
+  let ph = cast[ptr UncheckedArray[float32]](pHb)
+  let ph2 = cast[ptr UncheckedArray[float32]](pHb2)
+  for i in s..<e:
+    let v = ph[i]
+    ph[i] = (v / (1.0f32 + exp(-v))) * ph2[i]
+
+proc siluMultiplyMT*(ctx: var Master, hb, hb2: FloatTensor) =
+  let size = hb.size
+  let numThreads = countProcessors()
+  let chunkSize = (size + numThreads - 1) div numThreads
+  let pHb = addr hb.data[0]
+  let pHb2 = addr hb2.data[0]
+  ctx.awaitAll:
+    for t in 0..<numThreads:
+      let s = t * chunkSize; let e = min(s + chunkSize, size)
+      if s < e: ctx.spawn silu_multiply_worker(pHb, pHb2, s, e)
 
 proc getFloat*(t: FloatTensor, i: int): float32 {.inline.} =
   case t.kind:
